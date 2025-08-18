@@ -19,15 +19,15 @@ This tool allows you to scan single ports or ranges, identify open/closed ports,
 ## ⚡ Example Usage
 Run the program:
 ```bash
-python3 banner_grabber.py
+python3 full_port_scanner.py
 ```
 
 Example run:
 ```
 ===============================================
    Banner Grabbing & Port Scanner Tool
-   Developed by Wajid
-   GitHub: https://github.com/yourusername
+   Developed by Zamin Ali
+   GitHub: https://github.com/zamin-codes
 ===============================================
 
 Enter the IP address or domain name: google.com
@@ -63,13 +63,13 @@ If saving is enabled, results will be stored in `scan_results.txt` in the same d
 ## 🔧 Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/banner-grabber.git
+   git clone https://github.com/zamin-codes/Full_Port_Scanner.git
    cd banner-grabber
    ```
 
 2. Run the program:
    ```bash
-   python3 banner_grabber.py
+   python3 full_port_scanner.py
    ```
 
 ---
@@ -90,4 +90,4 @@ Do not use it on targets you don’t have permission to scan. Unauthorized scann
 
 ## 👨‍💻 Author
 - **Zamin Ali**  
-- GitHub: [yourusername](https://github.com/yourusername)
+- GitHub: [zamin-codes](https://github.com/zamin-codes)
