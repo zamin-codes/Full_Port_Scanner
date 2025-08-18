@@ -91,5 +91,5 @@ Do not use it on targets you don’t have permission to scan. Unauthorized scann
 ---
 
 ## 👨‍💻 Author
-- **Wajid**  
+- **Zamin Ali**  
 - GitHub: [yourusername](https://github.com/yourusername)
