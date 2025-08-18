@@ -1,0 +1,3 @@
+# Requirements for Banner Grabbing & Port Scanner Tool
+# No external libraries required, only standard Python libraries are used.
+# Just make sure you are running Python 3.x
