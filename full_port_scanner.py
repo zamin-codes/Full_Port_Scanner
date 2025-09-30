@@ -1,9 +1,32 @@
 import socket
 import threading
+import re
 import pyfiglet
+import time
+
+# -----------------------------
+# Small local vulnerability "database"
+# Each entry is a tuple (pattern, info_dict)
+# pattern is a regex applied to banner or "service" string to detect known vulnerable versions
+# info_dict contains: "name", "severity", "notes", "references"
+# NOTE: This is a small local DB for quick checks. For production use integrate with NVD/CVE feeds or vulnerability scanners.
+# -----------------------------
+VULN_DB = [
+    (r"OpenSSH[_\- ]?([0-9]+\.[0-9]+)", {"name": "OpenSSH older version", "severity": "medium", "notes": "Older OpenSSH versions may be vulnerable to various issues. Verify exact version and check CVE list.", "references": ["https://www.openssh.com/security.html"]}),
+    (r"Apache/?([0-9]+\.[0-9]+\.[0-9]+)", {"name": "Apache HTTPD", "severity": "high", "notes": "Certain Apache versions have known vulnerabilities (mod_ssl/mod_status). Check CVEs for exact version.", "references": ["https://httpd.apache.org/security_report.html"]}),
+    (r"nginx/?([0-9]+\.[0-9]+\.[0-9]+)", {"name": "nginx HTTPD", "severity": "high", "notes": "Known nginx vulnerabilities may affect some older releases.", "references": ["https://nginx.org/en/security_advisories.html"]}),
+    (r"Microsoft-HTTPAPI/([0-9]+\.[0-9]+)", {"name": "Microsoft HTTPAPI", "severity": "high", "notes": "Windows HTTP API versions could indicate Windows IIS/HTTP.sys version which had serious CVEs.", "references": ["https://msrc.microsoft.com/"]}),
+    (r"MSSQLServer|Microsoft SQL Server", {"name": "MSSQL Server", "severity": "high", "notes": "Check MS SQL Server version for remotely exploitable issues.", "references": ["https://msrc.microsoft.com/"]}),
+    (r"vsFTPd ([0-9]+\.[0-9]+)", {"name": "vsFTPD", "severity": "medium", "notes": "Some vsFTPd releases had backdoor issues in the past.", "references": []}),
+    (r"Exim \w*([0-9]+\.[0-9]+)", {"name": "Exim MTA", "severity": "high", "notes": "Exim historically had serious remote code execution vulnerabilities; check version-specific CVEs.", "references": []}),
+    (r"ProFTPD ([0-9]+\.[0-9]+)", {"name": "ProFTPD", "severity": "medium", "notes": "ProFTPD sometimes had mod_copy or path traversal issues.", "references": []}),
+    (r"OpenSSL ([0-9]+\.[0-9]+\.[0-9]+)", {"name": "OpenSSL", "severity": "high", "notes": "OpenSSL versions may contain critical CVEs. Verify exact patch level.", "references": ["https://www.openssl.org/news/vulnerabilities.html"]}),
+    (r"Tomcat/?([0-9]+\.[0-9]+\.[0-9]+)", {"name": "Apache Tomcat", "severity": "high", "notes": "Tomcat had several CVEs — check exact version.", "references": []}),
+]
 
 # -----------------------------
 # Dictionary of common ports and their typical services
+# (kept from your original script)
 # -----------------------------
 PORT_SERVICES = {
     20: "FTP-Data",
@@ -46,24 +69,21 @@ PORT_SERVICES = {
 }
 
 # -----------------------------
-# Function: Validate if input is a valid IPv4 address
+# Helpers: validation functions (kept)
 # -----------------------------
+
 def is_valid_ip(ip):
     try:
-        socket.inet_aton(ip)  # raises error if not a valid IP
+        socket.inet_aton(ip)
         return True
     except socket.error:
         return False
 
-# -----------------------------
-# Function: Validate a single port number
-# -----------------------------
+
 def is_valid_port(port):
     return port.isdigit() and 1 <= int(port) <= 65535
 
-# -----------------------------
-# Function: Validate a port range (e.g. "20-80")
-# -----------------------------
+
 def is_valid_port_range(port_range):
     if "-" in port_range:
         parts = port_range.split("-")
@@ -73,33 +93,123 @@ def is_valid_port_range(port_range):
     return False
 
 # -----------------------------
-# Function: Scan a single port
+# Function: Analyze banner and local DB for possible vulnerabilities
 # -----------------------------
-def scan_port(target, port, show_closed, save_results, results_list):
-    # Determine the service name (if known, otherwise "Unknown")
+
+def identify_vulnerabilities(service, banner):
+    findings = []
+    text = (banner or "") + " " + (service or "")
+    for pattern, info in VULN_DB:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            entry = info.copy()
+            entry["match"] = m.group(0)
+            # If version captured, include it
+            if m.groups():
+                entry["version"] = m.group(1)
+            findings.append(entry)
+    return findings
+
+# -----------------------------
+# Function: Send lightweight protocol probes to improve banners
+# (safe, minimal probes: HTTP HEAD, SMTP EHLO, simple text for FTP etc.)
+# -----------------------------
+
+def protocol_probe(s, port, target):
+    try:
+        if port in (80, 8080, 8000, 8888):
+            req = f"HEAD / HTTP/1.0\r\nHost: {target}\r\n\r\n"
+            s.sendall(req.encode())
+        elif port in (443, 8443):
+            # TLS handshake would be necessary to get a proper banner; skip active TLS handshake here
+            return None
+        elif port in (25, 587, 465):
+            # SMTP
+            s.sendall(b"EHLO example.com\r\n")
+        elif port in (21,):
+            # FTP often sends banner immediately, but sending a newline may trigger response
+            try:
+                s.sendall(b"\r\n")
+            except:
+                pass
+        elif port in (3306,):
+            # MySQL sends handshake upon connect; no probe needed
+            pass
+        else:
+            # Generic small payload to provoke a response for some services
+            try:
+                s.sendall(b"\r\n")
+            except:
+                pass
+        time.sleep(0.2)
+        try:
+            data = s.recv(2048)
+            return data.decode(errors="ignore").strip()
+        except:
+            return None
+    except Exception:
+        return None
+
+# -----------------------------
+# Function: Scan a single port (enhanced)
+# -----------------------------
+
+def scan_port(target, port, show_closed, save_results, results_list, vuln_check):
     service = PORT_SERVICES.get(port, "Unknown Service")
 
     try:
-        # Create socket
         s = socket.socket()
-        s.settimeout(2)  # Timeout prevents hanging
-        s.connect((target, port))  # Try connecting to target:port
+        s.settimeout(3)
+        s.connect((target, port))
 
-        # Try grabbing banner
+        # Try to read banner (some protocols send immediately)
+        banner = ""
         try:
-            banner = s.recv(1024).decode(errors="ignore").strip()
+            # First try a non-blocking recv to get any immediate banner
+            s.settimeout(1.0)
+            chunk = s.recv(2048)
+            banner = chunk.decode(errors='ignore').strip() if chunk else ""
         except:
-            banner = "No banner"
+            banner = ""
 
-        result = f"[+] Port {port} ({service}) OPEN - Banner: {banner}"
+        # Try better probes for common protocols to get a more informative banner
+        probe_banner = protocol_probe(s, port, target)
+        if probe_banner:
+            # If we got something from probe, append
+            if banner:
+                banner = banner + " | " + probe_banner
+            else:
+                banner = probe_banner
+
+        result = f"[+] Port {port} ({service}) OPEN - Banner: {banner or 'No banner'}"
         print(result)
+
+        # Vulnerability analysis
+        vulns = []
+        if vuln_check:
+            vulns = identify_vulnerabilities(service, banner)
+            if vulns:
+                print("    -> Potential vulnerabilities found:")
+                for v in vulns:
+                    print(f"       - {v['name']} (severity: {v['severity']}) match: {v.get('match')} version: {v.get('version','unknown')}")
+                    if v.get('notes'):
+                        print(f"         notes: {v['notes']}")
+                    if v.get('references'):
+                        refs = ", ".join(v['references'])
+                        if refs:
+                            print(f"         refs: {refs}")
 
         # Save result if needed
         if save_results:
-            results_list.append(result)
+            entry = result
+            if vulns:
+                entry += "\n    Potential vulnerabilities:\n"
+                for v in vulns:
+                    entry += f"    - {v['name']} (severity: {v['severity']}), match: {v.get('match')}\n"
+            results_list.append(entry)
 
         s.close()
-    except:
+    except Exception:
         if show_closed:
             result = f"[-] Port {port} ({service}) CLOSED or no response"
             print(result)
@@ -107,19 +217,18 @@ def scan_port(target, port, show_closed, save_results, results_list):
                 results_list.append(result)
 
 # -----------------------------
-# MAIN PROGRAM
+# MAIN PROGRAM (interaction)
 # -----------------------------
 
-# Step 1: Ask for target IP/domain
 zam_text = pyfiglet.figlet_format("ZAMIN ALI")
 print(zam_text)
 print("===============================================")
 print("\n* Copyright of Zamin Ali, 2024                              ")
 print("* Github Link: https://github.com/zamin-codes                              ")
 print("===============================================")
+
 target = input("Enter the IP address or domain name: ")
 
-# If not a valid IP, try resolving domain
 if not is_valid_ip(target):
     try:
         resolved_ip = socket.gethostbyname(target)
@@ -129,10 +238,8 @@ if not is_valid_ip(target):
         print("❌ Incorrect IP address or domain name")
         exit()
 
-# Step 2: Ask for port input
 port_input = input("Enter port (single, e.g. 80) or range (e.g. 20-25): ")
 
-# Validate input and create list of ports
 ports = []
 if is_valid_port(port_input):
     ports = [int(port_input)]
@@ -143,13 +250,14 @@ else:
     print("❌ Incorrect port or port range")
     exit()
 
-# Step 3: Ask whether to show closed ports
 choice = input("Do you want to see closed ports too? (yes/no): ").strip().lower()
 show_closed = choice in ["yes", "y"]
 
-# Step 4: Ask whether to save results
 save_choice = input("Do you want to save results to a file? (yes/no): ").strip().lower()
 save_results = save_choice in ["yes", "y"]
+
+vuln_choice = input("Perform local vulnerability checks based on banners? (yes/no): ").strip().lower()
+vuln_check = vuln_choice in ["yes", "y"]
 
 results_list = []
 
@@ -158,22 +266,25 @@ print(f"[INFO] Displaying {'open + closed ports' if show_closed else 'only open 
 if save_results:
     print("[INFO] Results will also be saved to 'scan_results.txt'\n")
 
-# Step 5: Start scanning with multithreading
 threads = []
 for port in ports:
-    t = threading.Thread(target=scan_port, args=(target, port, show_closed, save_results, results_list))
+    t = threading.Thread(target=scan_port, args=(target, port, show_closed, save_results, results_list, vuln_check))
     threads.append(t)
     t.start()
 
-# Step 6: Wait for all threads
 for t in threads:
     t.join()
 
-# Step 7: Save to file if needed
 if save_results and results_list:
-    with open("scan_results.txt", "w") as f:
+    with open("scan_results.txt", "w", encoding="utf-8") as f:
         for line in results_list:
             f.write(line + "\n")
     print("\n[INFO] Scan results saved to 'scan_results.txt'")
 
 print("\n[INFO] Scan completed ✅")
+
+# -----------------------------
+# Usage notes & legal reminder (printed to console by user)
+# -----------------------------
+print('\n[NOTE] This tool performs basic banner-based checks only.\n       For accurate vulnerability detection integrate with services like NVD feeds, Vulners API, or use full scanners (e.g., nmap with scripts, OpenVAS, Nessus).')
+print('[LEGAL] Only scan systems you own or have explicit permission to test. Unauthorized scanning may be illegal.')
